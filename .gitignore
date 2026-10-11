@@ -1,3 +1,6 @@
-*
-!myfs.c
-!README.md
+# arquivos gerados na compilacao
+*.o
+simulador
+
+# discos criados pelo simulador
+*.dsk

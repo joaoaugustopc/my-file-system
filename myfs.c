@@ -18,44 +18,61 @@
 #include <string.h>
 
 // DECLARACOES GLOBAIS
-#define SUPERBLOCK_SECTOR 0
-#define ROOT_INODE 1
+#define SUPERBLOCK_SECTOR 0  // setor 0 do disco guarda o superbloco
+#define ROOT_INODE 1 // O i-node 1 é o diretório raiz
 
 // Estrutura para representar um descritor de arquivo aberto
+// Estrura que mantêm os metadados dos arquivos, multiplos arquivos podem estar abertos, cada um com ser cursor independente, por exemplo.
+// O File Descriptor é um identificador temporário que representa uma abertura de arquivo. 
+// A tabela de arquivos abertos mantém o estado dessas aberturas em memória.
 typedef struct {
-  int used;
-  unsigned int inumber;
-  unsigned int cursor;
-  Disk *disk;
+  int used; //se a posição na tabela está ocupada
+  unsigned int inumber; // Qual i-node o arquivo referencia
+  unsigned int cursor; //offset, posição atual de leitura/escrita
+  Disk *disk; // Quai é o disco montado que o arquivo esta
 } FileDescriptor;
 
+
+// O gerenciamento de espaço livre é implementado como uma lista encadeada dentro do próprio disco,
+// Cada Cluster livre tem, no seu primeiro setor, um "ponteiro" nextClusterAddress para o próximo cluster livre
 typedef struct {
   unsigned long int nextClusterAddress;
 } FreeClusterHeader;
 
+
+
+
+// Um superbloco é uma estrutura de metadados que contém informações sobre o sistema de arquivos.
+// Sem o superbloco, o sistema de arquivos nao consegue ser montado e interpretado corretamente.
 typedef struct {
-  unsigned int numInodes;
-  unsigned int blockSize;
-  unsigned long int dataBeginSector;
-  unsigned long int dataLastCluster;
-  unsigned long int firstFreeClusterAddress;
+  unsigned int numInodes; // número de i-nodes
+  unsigned int blockSize; // tamanho do bloco em bytes
+  unsigned long int dataBeginSector; // onde começa a área de dados
+  unsigned long int dataLastCluster; // até onde vai
+  unsigned long int firstFreeClusterAddress; // cabeça da lista de clusters livres
 } SuperBlock;
 
+
+//Cada entrada mapeia: name -> inodeNumber
+// O diretório raiz é um arquivo cujo conteúdo é um vetor de DirEntry.
 typedef struct {
   unsigned int inodeNumber;
-  char name[MAX_FILENAME_LENGTH + 1];
+  char name[MAX_FILENAME_LENGTH + 1]; // O +1 é necessário para armazenar o caractere nulo '\0', que indica o fim da string em C. Sem isso, nomes com tamanho máximo não seriam strings válidas.
 } DirEntry;
 
-static FileDescriptor openFiles[MAX_FDS];
-static int initialized = 0;
-static int myfsMounted = 0;
-static unsigned int sbBlockSize = 0;
-static unsigned int sbFirstDataSector = 0;
-static unsigned int sbNumInodes = 0;
-static unsigned int sbTotalBlocks = 0;
+static FileDescriptor openFiles[MAX_FDS]; //tabelas de arquivos abertos, cada posição representa um arquivo identificado por um FD. Controlar múltiplos arquivos abertos ao mesmo tempo. 
+static int initialized = 0; // indica se a tabela de aquivos abertos ja foi inicializada. Funções como open, mount, isIdle podem ser chamadas várias vezes.
+// Mas inicializar a tabela mais de uma vez apagaria arquivos abertos. Usado em initFiledescriptors
+static int myfsMounted = 0;  //sem isso, read/write poderiam operar com FS “desmontado” ou sem estado consistente. Usado para verificar se o sistema de arquivos esta montado Com a suposição de que existe apenas um sistema de arquivos montados no trabalho.
+static unsigned int sbBlockSize = 0; // cache do superbloco em memória. Lido do superbloco no mount. Copiado para memória para acesso rápido
+static unsigned int sbFirstDataSector = 0; // Numero do setor onde começa a área de dados
+static unsigned int sbNumInodes = 0; // O número total de i-nodes do sistema de arquivos. (verificar se o inode existe, encontrar inode livre e evitar acessos fora da área de inodes)
+static unsigned int sbTotalBlocks = 0; // Quantidade total de blocos / cluster no disco para limitar alocação, validar endereços e controlar o espaço
 
 // FUNCOES AUXILIARES
 
+
+// Inicializa a tabela de arquivos umaúnica vez. Evita que arquivos abertos sejam apagados da tabela quando feito outros opens;
 static void initFileDescriptors() {
   if (!initialized) {
     for (int i = 0; i < MAX_FDS; i++) {
@@ -68,22 +85,33 @@ static void initFileDescriptors() {
   }
 }
 
+//Retorna 0 = sucesso e -1 = erro
+// Recebe disco onde será escrito e um ponteiro para o superbloco
+// Cria um superbloco persistente, antes o disco era apenas uma sequência de setores.
 static int writeSuperBlock(Disk *d, const SuperBlock *sb) {
-  unsigned char sector[DISK_SECTORDATASIZE];
-  memset(sector, 0, sizeof(sector));
 
-  memcpy(sector, "MYFS", 4);
-  memcpy(&sector[4], sb, sizeof(SuperBlock));
 
-  if (diskWriteSector(d, SUPERBLOCK_SECTOR, sector) != 0)
+  unsigned char sector[DISK_SECTORDATASIZE]; // char possui apenas 1byte. Buffer de 1 setor. Tamanho exatamente igual ao tamanho de um setor do disco.
+  // O tamanho do bloco ainda nao é conhecido. Ele é recupera através do prórpio superbloco.
+
+  memset(sector, 0, sizeof(sector)); // preenche todo o buffer com zero, evita lixos e garante previsibilidade
+
+  memcpy(sector, "MYFS", 4); // Copia os 4 bytes da string para o início do setor. Grava a assinatura.
+  memcpy(&sector[4], sb, sizeof(SuperBlock)); // copia a estrutura inteira do superbloco para o setor, logo após os 4 bytes da string serializado em binário.
+
+  if (diskWriteSector(d, SUPERBLOCK_SECTOR, sector) != 0) // escreve o buffer inteiro
     return -1;
 
   return 0;
 }
 
+
+//Essas funções implementam leitura/escrita de um bloco lógico que pode ter vários setores.
+
+// retorna 0 = sucesso e -1 = erro
 static int writeBlock(Disk *d, unsigned long int firstSector,
-                      unsigned int blockSize, const unsigned char *in) {
-  unsigned int sectorsPerBlock = blockSize / DISK_SECTORDATASIZE;
+                      unsigned int blockSize, const unsigned char *in) { //ponyeiro para um buffer com os dados do bloco
+  unsigned int sectorsPerBlock = blockSize / DISK_SECTORDATASIZE; //calcula quantos setores existem dentro de 1 bloco. No format há a garantia que o blocksize é múltiplo do tamanho do setor
 
   for (unsigned int i = 0; i < sectorsPerBlock; i++) {
     if (diskWriteSector(d, firstSector + i,
@@ -105,6 +133,7 @@ static int readBlock(Disk *d, unsigned long int firstSector,
   return 0;
 }
 
+// lê setor 0, valida a assintatura e copia a struct
 static int readSuperBlock(Disk *d, SuperBlock *sb) {
   unsigned char sector[DISK_SECTORDATASIZE];
   if (diskReadSector(d, SUPERBLOCK_SECTOR, sector) != 0)
@@ -118,8 +147,10 @@ static int readSuperBlock(Disk *d, SuperBlock *sb) {
   return 0;
 }
 
+
+// Essa é a alocação de espaço livre do disco
 static unsigned long int allocateFreeCluster(Disk *d, SuperBlock *sb) {
-  if (sb->firstFreeClusterAddress == 0)
+  if (sb->firstFreeClusterAddress == 0) // Não há espaço 
     return 0;
 
   unsigned long int allocated = sb->firstFreeClusterAddress;
@@ -138,7 +169,7 @@ static unsigned long int allocateFreeCluster(Disk *d, SuperBlock *sb) {
     return 0;
 
   memset(sector0, 0, sizeof(sector0));
-  if (diskWriteSector(d, allocated, sector0) != 0)
+  if (diskWriteSector(d, allocated, sector0) != 0) // para evitar lixo de memória e realmente deixa de ser livre
     return 0;
 
   return allocated;
@@ -161,6 +192,10 @@ int myFSIsIdle(Disk *d) {
 // com tamanho de blocos igual a blockSize. Retorna o numero total de
 // blocos disponiveis no disco, se formatado com sucesso. Caso contrario,
 // retorna -1.
+// Zerar setores de metadados
+// criar lista encadeada de clusters livres
+// gravar superbloco
+// criar i-nodes vazios 
 int myFSFormat(Disk *d, unsigned int blockSize) {
   printf("\n-- Formatting disk %d...", diskGetId(d));
   printf("\n   Block size: %u bytes", blockSize);
@@ -179,7 +214,7 @@ int myFSFormat(Disk *d, unsigned int blockSize) {
     return -1;
   }
 
-  if ((blockSize % DISK_SECTORDATASIZE) != 0) {
+  if ((blockSize % DISK_SECTORDATASIZE) != 0) { // disco so le/escreve setores inteiros. Se nao teria "meio setor escrito/lido"
     printf("\n!! Error: Block size (%u) must be multiple of sector size (%d). "
            "Disk ID: %d\n",
            blockSize, DISK_SECTORDATASIZE, diskGetId(d));
@@ -208,8 +243,9 @@ int myFSFormat(Disk *d, unsigned int blockSize) {
 
  
   unsigned int inodesBeginSector = inodeAreaBeginSector();
-  unsigned int inodesSectors =
+  unsigned int inodesSectors = //Quantos setores do disco eu preciso reservar para armazenar os i-nodes ? Conta para arredondar para cima
       (numInodes + inodeNumInodesPerSector() - 1) / inodeNumInodesPerSector();
+
   unsigned int dataBeginSector = inodesBeginSector + inodesSectors;
 
   unsigned int sectorsPerCluster = blockSize / DISK_SECTORDATASIZE;
@@ -344,6 +380,8 @@ int myFSFormat(Disk *d, unsigned int blockSize) {
 // o superbloco na memoria. Na desmontagem (x=0), quaisquer dados pendentes
 // de gravacao devem ser persistidos no disco. Retorna um positivo se a
 // montagem ou desmontagem foi bem sucedida ou, caso contrario, 0.
+// 1 monta e 0 desmonta
+// retorna 1 sucesso e 0 falha
 int myFSxMount(Disk *d, int x) {
   if (!d)
     return 0;

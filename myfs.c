@@ -1,7 +1,7 @@
 /*
  *  myfs.c - Implementacao do sistema de arquivos MyFS
  *
- *  Autores: Caio Louback, Diogo Carminatti, João Auusto Pilato, Karen Jardim
+ *  Autores: Caio Louback, Diogo Carminatti, João Augusto Pilato, Karen Jardim
  *  Projeto: Trabalho Pratico II - Sistemas Operacionais
  *  Organizacao: Universidade Federal de Juiz de Fora
  *  Departamento: Dep. Ciencia da Computacao
